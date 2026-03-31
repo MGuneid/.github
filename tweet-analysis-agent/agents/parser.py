@@ -14,8 +14,53 @@ import json
 import os
 
 import anthropic
+import httpx
 
 from models.schemas import Category, Claim, ParsedTweet, RawTweet, Sentiment, Strategy, Tool
+
+
+def _get_ai_client() -> tuple[str, object]:
+    """Get AI client - tries Anthropic first, falls back to OpenRouter.
+    Returns (backend_name, client)."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        return "anthropic", anthropic.Anthropic(api_key=api_key)
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if openrouter_key:
+        return "openrouter", openrouter_key
+
+    raise RuntimeError(
+        "No AI API key found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in .env"
+    )
+
+
+def _call_ai(backend: str, client: object, prompt: str, max_tokens: int = 2000) -> str:
+    """Call AI model via Anthropic or OpenRouter."""
+    if backend == "anthropic":
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+
+    # OpenRouter fallback
+    with httpx.Client(timeout=httpx.Timeout(60.0)) as http:
+        resp = http.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {client}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "anthropic/claude-sonnet-4",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 
 PARSE_PROMPT = """Analyze this tweet from the crypto/DeFi space. Extract ALL structured information.
 
@@ -57,21 +102,15 @@ Rules:
 - Return ONLY valid JSON, no markdown or explanation"""
 
 
-def _parse_single_tweet(client: anthropic.Anthropic, tweet: RawTweet) -> ParsedTweet:
-    """Parse a single tweet using Claude."""
+def _parse_single_tweet(backend: str, client: object, tweet: RawTweet) -> ParsedTweet:
+    """Parse a single tweet using Claude (via Anthropic or OpenRouter)."""
     prompt = PARSE_PROMPT.format(
         author=tweet.author_username,
         text=tweet.text,
         url=tweet.url,
     )
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = response.content[0].text.strip()
+    text = _call_ai(backend, client, prompt, max_tokens=2000)
     # Strip markdown code fences if present
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
@@ -140,17 +179,14 @@ def _parse_single_tweet(client: anthropic.Anthropic, tweet: RawTweet) -> ParsedT
 
 def run_parser(raw_tweets: list[RawTweet]) -> list[ParsedTweet]:
     """Run the parser agent on all raw tweets."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Required for the parser agent.")
-
-    client = anthropic.Anthropic(api_key=api_key)
+    backend, client = _get_ai_client()
+    print(f"  Using AI backend: {backend}")
     results = []
 
     for i, tweet in enumerate(raw_tweets):
         print(f"  Parsing [{i + 1}/{len(raw_tweets)}] @{tweet.author_username}: {tweet.text[:60]}...")
         try:
-            parsed = _parse_single_tweet(client, tweet)
+            parsed = _parse_single_tweet(backend, client, tweet)
             results.append(parsed)
             print(
                 f"    → {len(parsed.claims)} claims, {len(parsed.strategies)} strategies, "

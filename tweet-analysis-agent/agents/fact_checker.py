@@ -17,8 +17,51 @@ import json
 import os
 
 import anthropic
+import httpx
 
 from models.schemas import Claim, Evidence, ParsedTweet, Verdict, VerifiedClaim
+
+
+def _get_ai_client() -> tuple[str, object]:
+    """Get AI client - tries Anthropic first, falls back to OpenRouter."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        return "anthropic", anthropic.Anthropic(api_key=api_key)
+
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if openrouter_key:
+        return "openrouter", openrouter_key
+
+    raise RuntimeError(
+        "No AI API key found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in .env"
+    )
+
+
+def _call_ai(backend: str, client: object, prompt: str, max_tokens: int = 500) -> str:
+    """Call AI model via Anthropic or OpenRouter."""
+    if backend == "anthropic":
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
+
+    with httpx.Client(timeout=httpx.Timeout(60.0)) as http:
+        resp = http.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {client}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "anthropic/claude-sonnet-4",
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
 from utils.external_apis import (
     brave_search,
     coingecko_get_price,
@@ -162,7 +205,7 @@ def _gather_evidence_for_claim(claim: Claim, tweet: ParsedTweet) -> list[Evidenc
     return evidence
 
 
-def _synthesize_verdict(client: anthropic.Anthropic, claim: Claim, evidence: list[Evidence], tweet_text: str) -> tuple[Verdict, float, str]:
+def _synthesize_verdict(backend: str, client: object, claim: Claim, evidence: list[Evidence], tweet_text: str) -> tuple[Verdict, float, str]:
     """Use Claude to synthesize evidence and determine verdict."""
     evidence_text = "\n".join(
         f"[{e.source}] {e.data}" + (f" (url: {e.url})" if e.url else "")
@@ -187,13 +230,7 @@ Based on the evidence, determine:
 Return ONLY valid JSON:
 {{"verdict": "...", "confidence": 0.0, "reasoning": "..."}}"""
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = response.content[0].text.strip()
+    text = _call_ai(backend, client, prompt, max_tokens=500)
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
     if text.endswith("```"):
@@ -216,11 +253,8 @@ Return ONLY valid JSON:
 
 def run_fact_checker(parsed_tweets: list[ParsedTweet]) -> list[dict]:
     """Run fact-checker on all parsed tweets. Returns list of tweet dicts with verified claims."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Required for the fact-checker agent.")
-
-    client = anthropic.Anthropic(api_key=api_key)
+    backend, client = _get_ai_client()
+    print(f"  Using AI backend: {backend}")
     results = []
 
     for i, tweet in enumerate(parsed_tweets):
@@ -235,7 +269,7 @@ def run_fact_checker(parsed_tweets: list[ParsedTweet]) -> list[dict]:
             print(f"      Gathered {len(evidence)} pieces of evidence")
 
             # Synthesize verdict via Claude
-            verdict, confidence, reasoning = _synthesize_verdict(client, claim, evidence, tweet.text)
+            verdict, confidence, reasoning = _synthesize_verdict(backend, client, claim, evidence, tweet.text)
             print(f"      → {verdict.value} (confidence: {confidence:.0%})")
 
             verified_claims.append(
