@@ -4,7 +4,7 @@ Supports two modes:
 - URL mode: Reads tweet URLs from a file, fetches content
 - Bookmark mode: Fetches all bookmarks from authenticated Twitter user
 
-Fallback chain: Twitter API → Tavily search → Brave search → skip
+Fallback chain: Twitter web browsing → Tavily search → Brave search → skip
 """
 
 from __future__ import annotations
@@ -112,8 +112,8 @@ def _fetch_via_brave_search(url: str) -> Optional[RawTweet]:
     return None
 
 
-def _fetch_via_twitter_api(urls: list[str]) -> tuple[list[RawTweet], list[str]]:
-    """Fetch tweets via Twitter API. Returns (fetched, failed_urls)."""
+def _fetch_via_twitter_web(urls: list[str]) -> tuple[list[RawTweet], list[str]]:
+    """Fetch tweets via Twitter web browsing (GraphQL + guest token). No credits needed."""
     tweet_ids = []
     url_map = {}
     for url in urls:
@@ -140,7 +140,7 @@ def _fetch_via_twitter_api(urls: list[str]) -> tuple[list[RawTweet], list[str]]:
             if tid not in fetched_ids:
                 failed_urls.append(url)
     except Exception as e:
-        print(f"  [WARN] Twitter API failed: {e}")
+        print(f"  [WARN] Twitter web fetch failed: {e}")
         failed_urls = list(url_map.values())
 
     return fetched, failed_urls
@@ -173,13 +173,13 @@ def run_ingestion(
         urls = urls[:limit]
     print(f"  Loaded {len(urls)} URLs from {input_file}")
 
-    # Try Twitter API first
-    print("  Attempting Twitter API batch fetch...")
-    fetched, failed = _fetch_via_twitter_api(urls)
+    # Fetch via Twitter web browsing (like a human, no credits needed)
+    print("  Fetching via Twitter web browsing...")
+    fetched, failed = _fetch_via_twitter_web(urls)
     if fetched:
-        print(f"  Twitter API: {len(fetched)} fetched, {len(failed)} remaining")
+        print(f"  Twitter web: {len(fetched)} fetched, {len(failed)} remaining")
     else:
-        print(f"  Twitter API unavailable, using search fallback for all {len(failed)} URLs")
+        print(f"  Twitter web failed, using search fallback for all {len(failed)} URLs")
 
     # Fallback to Tavily search for failures
     still_failed = []

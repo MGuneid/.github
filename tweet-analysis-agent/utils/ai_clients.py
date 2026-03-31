@@ -1,10 +1,13 @@
 """Multi-model AI client layer.
 
 Model hierarchy (tested & working as of 2026-03-31):
-- PRIMARY: Qwen 3.6 Plus (via OpenRouter, free) - main analysis
-- SECOND_OPINION: Nemotron 120B (via OpenRouter, free) - alternative perspective
-- CLAUDE: (when Anthropic credits are added) - upgrades primary to Claude
-- KIMI: (when Moonshot balance is topped up) - additional perspective
+- PRIMARY: Qwen 3.6 Plus (1M context, free via OpenRouter) - main analysis
+- SECOND_OPINION: Nemotron 120B (262K context, free via OpenRouter) - different architecture
+- BACKUP MODELS: 23 more free models available as fallbacks
+
+Optional paid upgrades (when credits are added):
+- CLAUDE: Anthropic API (needs separate credits from subscription)
+- KIMI: Moonshot AI (needs balance top-up)
 
 The fact-checker uses PRIMARY + SECOND_OPINION for consensus.
 The parser uses only the PRIMARY model.
@@ -20,13 +23,21 @@ import httpx
 
 TIMEOUT = httpx.Timeout(90.0)
 
-# Tested & working free models on OpenRouter
-PRIMARY_FREE_MODEL = "qwen/qwen3.6-plus-preview:free"
-SECOND_FREE_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+# Tested & working free models on OpenRouter (as of 2026-03-31)
+# Ranked by capability and context window
+PRIMARY_FREE_MODEL = "qwen/qwen3.6-plus-preview:free"          # 1M context, best quality
+SECOND_FREE_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"    # 262K context, 120B MoE
+
+# Backup models in fallback order (all free, tested working)
 BACKUP_FREE_MODELS = [
-    "minimax/minimax-m2.5:free",
-    "stepfun/step-3.5-flash:free",
-    "arcee-ai/trinity-large-preview:free",
+    "stepfun/step-3.5-flash:free",                  # 256K context, strong reasoning
+    "minimax/minimax-m2.5:free",                     # 196K context, SOTA
+    "arcee-ai/trinity-large-preview:free",           # 131K context, 400B MoE
+    "nousresearch/hermes-3-llama-3.1-405b:free",     # 131K context, 405B params
+    "meta-llama/llama-3.3-70b-instruct:free",        # 65K context, Meta 70B
+    "google/gemma-3-27b-it:free",                    # 131K context, Google 27B
+    "z-ai/glm-4.5-air:free",                         # 131K context, Zhipu AI
+    "qwen/qwen3-next-80b-a3b-instruct:free",         # 262K context, lightweight MoE
 ]
 
 
