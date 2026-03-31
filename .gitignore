@@ -1,1 +1,10 @@
 .idea
+.env
+.venv/
+__pycache__/
+*.pyc
+tweet-analysis-agent/data/raw/
+tweet-analysis-agent/data/parsed/
+tweet-analysis-agent/data/verified/
+tweet-analysis-agent/data/tested/
+tweet-analysis-agent/reports/
