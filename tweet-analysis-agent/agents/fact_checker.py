@@ -1,4 +1,4 @@
-"""Fact-Checker Agent - Verifies claims against 9 external sources.
+"""Fact-Checker Agent - Verifies claims against 9 external sources + multi-model consensus.
 
 Routing logic:
 - Crypto price claims → CoinGecko + DexScreener
@@ -8,60 +8,16 @@ Routing logic:
 - Trading pair/liquidity claims → DexScreener
 - General claims → Tavily + Brave dual-search
 
-Uses Claude to synthesize multi-source evidence and assign verdicts.
+Uses primary AI model to synthesize evidence, then gets a second opinion
+from a different model for consensus scoring.
 """
 
 from __future__ import annotations
 
 import json
-import os
-
-import anthropic
-import httpx
 
 from models.schemas import Claim, Evidence, ParsedTweet, Verdict, VerifiedClaim
-
-
-def _get_ai_client() -> tuple[str, object]:
-    """Get AI client - tries Anthropic first, falls back to OpenRouter."""
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
-        return "anthropic", anthropic.Anthropic(api_key=api_key)
-
-    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if openrouter_key:
-        return "openrouter", openrouter_key
-
-    raise RuntimeError(
-        "No AI API key found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY in .env"
-    )
-
-
-def _call_ai(backend: str, client: object, prompt: str, max_tokens: int = 500) -> str:
-    """Call AI model via Anthropic or OpenRouter."""
-    if backend == "anthropic":
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.content[0].text.strip()
-
-    with httpx.Client(timeout=httpx.Timeout(60.0)) as http:
-        resp = http.post(
-            "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {client}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "anthropic/claude-sonnet-4",
-                "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+from utils.ai_clients import call_primary, call_second_opinion
 from utils.external_apis import (
     brave_search,
     coingecko_get_price,
@@ -205,22 +161,15 @@ def _gather_evidence_for_claim(claim: Claim, tweet: ParsedTweet) -> list[Evidenc
     return evidence
 
 
-def _synthesize_verdict(backend: str, client: object, claim: Claim, evidence: list[Evidence], tweet_text: str) -> tuple[Verdict, float, str]:
-    """Use Claude to synthesize evidence and determine verdict."""
-    evidence_text = "\n".join(
-        f"[{e.source}] {e.data}" + (f" (url: {e.url})" if e.url else "")
-        for e in evidence
-    )
+VERDICT_PROMPT = """You are a crypto fact-checker. Analyze this claim against the evidence.
 
-    prompt = f"""You are a crypto fact-checker. Analyze this claim against the evidence.
+CLAIM: "{claim_text}"
+CLAIM TYPE: {claim_type}
 
-CLAIM: "{claim.text}"
-CLAIM TYPE: {claim.claim_type}
-
-ORIGINAL TWEET CONTEXT: "{tweet_text[:500]}"
+ORIGINAL TWEET CONTEXT: "{tweet_text}"
 
 EVIDENCE GATHERED:
-{evidence_text if evidence_text else "No evidence could be gathered."}
+{evidence_text}
 
 Based on the evidence, determine:
 1. verdict: "verified" (evidence supports claim), "debunked" (evidence contradicts claim), "partially_true" (some aspects true, others not), or "unverifiable" (insufficient evidence)
@@ -230,7 +179,9 @@ Based on the evidence, determine:
 Return ONLY valid JSON:
 {{"verdict": "...", "confidence": 0.0, "reasoning": "..."}}"""
 
-    text = _call_ai(backend, client, prompt, max_tokens=500)
+
+def _parse_verdict_json(text: str) -> tuple[Verdict, float, str]:
+    """Parse verdict JSON from AI response."""
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
     if text.endswith("```"):
@@ -238,23 +189,71 @@ Return ONLY valid JSON:
     if text.startswith("json"):
         text = text[4:]
 
+    data = json.loads(text.strip())
     try:
-        data = json.loads(text.strip())
-        try:
-            verdict = Verdict(data.get("verdict", "unverifiable"))
-        except ValueError:
-            verdict = Verdict.UNVERIFIABLE
-        confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
-        reasoning = data.get("reasoning", "")
-        return verdict, confidence, reasoning
+        verdict = Verdict(data.get("verdict", "unverifiable"))
+    except ValueError:
+        verdict = Verdict.UNVERIFIABLE
+    confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+    reasoning = data.get("reasoning", "")
+    return verdict, confidence, reasoning
+
+
+def _synthesize_verdict(claim: Claim, evidence: list[Evidence], tweet_text: str) -> tuple[Verdict, float, str]:
+    """Use primary + second opinion models to determine verdict with consensus."""
+    evidence_text = "\n".join(
+        f"[{e.source}] {e.data}" + (f" (url: {e.url})" if e.url else "")
+        for e in evidence
+    )
+
+    prompt = VERDICT_PROMPT.format(
+        claim_text=claim.text,
+        claim_type=claim.claim_type,
+        tweet_text=tweet_text[:500],
+        evidence_text=evidence_text if evidence_text else "No evidence could be gathered.",
+    )
+
+    # Primary verdict
+    primary_text = call_primary(prompt, max_tokens=500)
+    try:
+        verdict, confidence, reasoning = _parse_verdict_json(primary_text)
     except (json.JSONDecodeError, KeyError):
         return Verdict.UNVERIFIABLE, 0.0, "Failed to synthesize evidence."
+
+    # Get second opinion for consensus (non-blocking - if it fails, we just use primary)
+    opinions = call_second_opinion(prompt, max_tokens=500)
+    second_verdicts = []
+    for model_name, response in opinions.items():
+        if response:
+            try:
+                sv, sc, sr = _parse_verdict_json(response)
+                second_verdicts.append((model_name, sv, sc, sr))
+                print(f"        Second opinion ({model_name}): {sv.value} ({sc:.0%})")
+            except (json.JSONDecodeError, KeyError, ValueError):
+                pass
+
+    # Consensus adjustment: if second opinions disagree, lower confidence
+    if second_verdicts:
+        agreeing = sum(1 for _, sv, _, _ in second_verdicts if sv == verdict)
+        total = len(second_verdicts)
+        if agreeing == 0 and total > 0:
+            # All second opinions disagree - lower confidence significantly
+            confidence = max(0.1, confidence * 0.6)
+            reasoning += f" [Note: {total} second opinion(s) disagreed]"
+        elif agreeing < total:
+            # Some disagree - lower confidence slightly
+            confidence = max(0.2, confidence * 0.85)
+            reasoning += f" [{agreeing}/{total} second opinion(s) agreed]"
+        else:
+            # All agree - boost confidence slightly
+            confidence = min(1.0, confidence * 1.1)
+            reasoning += f" [Consensus: all {total} models agreed]"
+
+    return verdict, confidence, reasoning
 
 
 def run_fact_checker(parsed_tweets: list[ParsedTweet]) -> list[dict]:
     """Run fact-checker on all parsed tweets. Returns list of tweet dicts with verified claims."""
-    backend, client = _get_ai_client()
-    print(f"  Using AI backend: {backend}")
     results = []
 
     for i, tweet in enumerate(parsed_tweets):
@@ -268,8 +267,8 @@ def run_fact_checker(parsed_tweets: list[ParsedTweet]) -> list[dict]:
             evidence = _gather_evidence_for_claim(claim, tweet)
             print(f"      Gathered {len(evidence)} pieces of evidence")
 
-            # Synthesize verdict via Claude
-            verdict, confidence, reasoning = _synthesize_verdict(backend, client, claim, evidence, tweet.text)
+            # Synthesize verdict with multi-model consensus
+            verdict, confidence, reasoning = _synthesize_verdict(claim, evidence, tweet.text)
             print(f"      → {verdict.value} (confidence: {confidence:.0%})")
 
             verified_claims.append(
